@@ -1,0 +1,19 @@
+# Do not include azure-functions-worker in this file
+# The Python Worker is managed by the Azure Functions platform
+# Manually managing azure-functions-worker may cause unexpected issues
+
+azure-functions
+jsonschema
+zeep
+psycopg2-binary
+requests
+python-dotenv
+dicttoxml
+reportlab
+azure-functions
+psycopg2-binary
+reportlab
+zeep
+requests
+sendgrid
+azure-storage-blob
