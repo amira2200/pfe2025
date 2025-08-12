@@ -15,6 +15,13 @@ from azure.storage.blob import BlobServiceClient
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition
 import base64
+from io import BytesIO
+from datetime import datetime
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.pdfgen import canvas
+from reportlab.platypus import Table, TableStyle
 
 order_schema = {
     "type": "object",
@@ -255,95 +262,328 @@ def process_pending_orders():
                 f"❌ Erreur lors du traitement de la commande ID {order_id} : {str(e)}")
 
 
-def generate_pdf_by_type(order_payload):
-    order_type = order_payload.get("orderType", "sale")
+# ========= Helpers de mise en page =========
+def _header_block(c, title_en, doc_info):
+    W, H = A4
+    M = 12*mm
+    y = H - M
 
-    if order_type == "sale":
-        return generate_sale_pdf(order_payload)
-    elif order_type == "return":
-        return generate_return_pdf(order_payload)
-    elif order_type == "replacement":
-        return generate_replacement_pdf(order_payload)
-    else:
-        raise ValueError("Type de commande invalide")
+    # En‑tête bilingue société (reprend ton exemple)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawCentredString(W/2, y, "راشيدين آر آر بي لتجارة التبغ ذ.م.م")
+    y -= 6*mm
+    c.setFont("Helvetica", 12)
+    c.drawCentredString(W/2, y, "RASHIDEEN R R P TOBACCO TRADING LLC")
+    y -= 8*mm
 
+    # Service client + TVA
+    c.setFont("Helvetica", 9)
+    c.drawString(M, y, "Customer care N.800-8500017 خدمة العملاء")
+    c.drawRightString(
+        W-M, y, "VAT Registration.: 100304102500003 الرقم الضريبي")
+    y -= 10*mm
 
-def generate_sale_pdf(order):
-    buffer = BytesIO()
-    pdf = canvas.Canvas(buffer)
-    pdf.setTitle("TAX INVOICE")
+    # Titre
+    c.setFont("Helvetica-Bold", 18)
+    c.drawCentredString(W/2, y, title_en)
+    y -= 10*mm
 
-    pdf.drawString(100, 800, "TAX INVOICE")
-    pdf.drawString(100, 780, f"Order Number: {order.get('orderNumber')}")
-    pdf.drawString(
-        100, 760, f"Customer: {order.get('firstName', '')} {order.get('lastName', '')}")
-    pdf.drawString(100, 740, f"Email: {order.get('email', '')}")
-    pdf.drawString(100, 720, f"Date: {order.get('orderDate', '')}")
-    pdf.drawString(100, 700, f"Total: {order.get('totalAmount', 0)} AED")
-
-    y = 660
-    for item in order.get("items", []):
-        pdf.drawString(
-            100, y, f"- {item.get('sku')} x{item.get('quantity')} = {item.get('finalPrice')} AED")
-        y -= 20
-
-    pdf.showPage()
-    pdf.save()
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-def generate_return_pdf(order):
-    buffer = BytesIO()
-    pdf = canvas.Canvas(buffer)
-    pdf.setTitle("TAX CREDIT NOTE")
-
-    pdf.drawString(100, 800, "TAX CREDIT NOTE")
-    pdf.drawString(100, 780, f"Return Number: {order.get('orderNumber')}")
-    pdf.drawString(
-        100, 760, f"Customer: {order.get('firstName', '')} {order.get('lastName', '')}")
-    pdf.drawString(100, 740, f"Email: {order.get('email', '')}")
-    pdf.drawString(100, 720, f"Date: {order.get('orderDate', '')}")
-    pdf.drawString(
-        100, 700, f"Refund Total: {order.get('totalAmount', 0)} AED")
-
-    y = 660
-    for item in order.get("items", []):
-        pdf.drawString(
-            100, y, f"- {item.get('sku')} returned x{item.get('quantity')} = {item.get('finalPrice')} AED")
-        y -= 20
-
-    pdf.showPage()
-    pdf.save()
-    buffer.seek(0)
-    return buffer.getvalue()
+    # Lignes info
+    c.setFont("Helvetica", 11)
+    c.drawString(M, y, f"Customer : {doc_info.get('customer','')}   العميل")
+    right_label = doc_info.get('label_no', 'Invoice No.')
+    c.drawRightString(
+        W-M, y, f"{right_label}: {doc_info.get('number','')}  رقم الفاتورة")
+    y -= 6*mm
+    c.drawString(M, y, f"Date: {doc_info.get('date','')} التاريخ")
+    c.drawRightString(W-M, y, f"Time:  {doc_info.get('time','')} الوقت")
+    return y - 8*mm  # position Y pour la suite
 
 
-def generate_replacement_pdf(order):
-    buffer = BytesIO()
-    pdf = canvas.Canvas(buffer)
-    pdf.setTitle("REPLACEMENT NOTE")
+def _info_footer(c):
+    W, H = A4
+    M = 12*mm
+    # Texte court (comme sur tes factures)
+    c.setFont("Helvetica", 8)
+    c.drawCentredString(W/2, 25*mm,
+                        "This is a computer generated document and does not require a signature. "
+                        "Consideration charged includes prices of all items   Terms & Conditions apply")
 
-    pdf.drawString(100, 800, "REPLACEMENT ORDER")
-    pdf.drawString(100, 780, f"Replacement Order: {order.get('orderNumber')}")
-    pdf.drawString(
-        100, 760, f"Customer: {order.get('firstName', '')} {order.get('lastName', '')}")
-    pdf.drawString(100, 740, f"Email: {order.get('email', '')}")
-    pdf.drawString(100, 720, f"Date: {order.get('orderDate', '')}")
-    pdf.drawString(
-        100, 700, f"Net Adjustment: {order.get('totalAmount', 0)} AED")
+    c.setFont("Helvetica", 7.2)
+    block_en = ("Information on Returns and Warranty • Please retain the original invoice. "
+                "Return allowed within 14 days in unopened packaging. "
+                "Consumables (incl. tobacco) are not eligible. "
+                "Warranty for electronics is 12 months from purchase date.")
+    block_ar = ("معلومات عن المرتجعات والضمان • يرجى الاحتفاظ بالفاتورة الأصلية. "
+                "يسمح بالإرجاع خلال 14 يوماً مع عبوة أصلية غير مفتوحة. "
+                "المنتجات الاستهلاكية (بما فيها التبغ) غير قابلة للإرجاع. "
+                "مدة الضمان 12 شهراً من تاريخ الشراء.")
+    c.drawString(M, 13*mm, block_en)
+    c.drawString(M, 8*mm, block_ar)
 
-    y = 660
-    for item in order.get("items", []):
-        action = "Added" if item.get("quantity") > 0 else "Removed"
-        pdf.drawString(
-            100, y, f"- {item.get('sku')} {action} x{abs(item.get('quantity'))} = {item.get('finalPrice')} AED")
-        y -= 20
 
-    pdf.showPage()
-    pdf.save()
-    buffer.seek(0)
-    return buffer.getvalue()
+def _make_table(data, col_widths):
+    tbl = Table(data, colWidths=col_widths, hAlign='LEFT')
+    tbl.setStyle(TableStyle([
+        ('GRID', (0, 0), (-1, -1), 0.25, colors.black),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONT', (0, 0), (-1, -1), 'Helvetica', 9),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.whitesmoke),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 4),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+        ('TOPPADDING', (0, 0), (-1, -1), 3),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+    ]))
+    return tbl
+
+
+def _totals_block(c, y, totals, voucher=False):
+    W, H = A4
+    M = 12*mm
+    c.setFont("Helvetica", 10)
+    y -= 2*mm
+    c.drawString(M, y, "Method of Payment طريقة الدفع")
+    c.drawRightString(W-M, y, f"Amount المبلغ {totals.get('paid','0.00')}    "
+                      f"Qty of items sold مجموع الكميات {totals.get('qty','0')}")
+    y -= 10*mm
+
+    lines = [
+        ("Total Amount excl. VAT AED", totals.get('subtotal', '0.00')),
+        ("VAT AED", totals.get('vat', '0.00')),
+        ("Total after VAT AED", totals.get('total', '0.00')),
+    ]
+    if voucher:
+        lines.append(("Voucher AED", totals.get('voucher', '0')))
+        lines.append(("Total after VAT and voucher AED",
+                     totals.get('after_voucher', '0.00')))
+    for label, val in lines:
+        c.drawString(M, y, f"{label}  المجموع")
+        c.drawRightString(W-M, y, str(val))
+        y -= 6*mm
+    return y
+
+# ========= Moteur choisi selon orderType =========
+
+
+def generate_pdf_by_type(order):
+    t = (order or {}).get("orderType", "sale")
+    if t == "sale":
+        return _generate_sale_pdf(order)
+    if t == "return":
+        return _generate_return_pdf(order)
+    if t == "replacement":
+        return _generate_replacement_pdf(order)
+    raise ValueError("Type de commande invalide")
+
+# ========= Templates =========
+
+
+def _now_hhmm():
+    return datetime.now().strftime("%I:%M %p")
+
+
+def _name(order):
+    return f"{order.get('firstName','').strip()} {order.get('lastName','').strip()}".strip() or "Customer"
+
+
+def _generate_sale_pdf(order):
+    """
+    Colonnes : Reference | Description | Qty | U.Price | Value (Tax Excl) | 5% VAT | Total
+    Hypothèse : 'finalPrice' = prix unitaire TTC. On calcule HT = TTC / 1.05 et TVA = TTC - HT.
+    """
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+
+    y = _header_block(c, "TAX INVOICE", {
+        "customer": _name(order),
+        "label_no": "Invoice No.",
+        "number": str(order.get("orderNumber", "")),
+        "date": str(order.get("orderDate", "")),
+        "time": _now_hhmm(),
+    })
+
+    # En-têtes bilingues
+    data = [[
+        "الرقم المرجعي\nReference",
+        "الوصف\nDescription",
+        "الكمية\nQty",
+        "سعر الوحدة\nU.Price",
+        "سعر الوحدة بدون ضريبة\nValue (Tax Excl)",
+        "نسبة ضريبة 5%\n5% VAT",
+        "المبلغ الإجمالي\nTotal"
+    ]]
+
+    subtotal_ht = 0.0
+    total_vat = 0.0
+    total_ttc = 0.0
+    total_qty = 0
+
+    for it in order.get("items", []):
+        ref = str(it.get("sku", ""))
+        qty = int(it.get("quantity", 0))
+        u_ttc = float(it.get("finalPrice", 0))   # prix unitaire TTC
+        u_ht = round(u_ttc / 1.05, 2)
+        u_vat = round(u_ttc - u_ht, 2)
+
+        line_ht = round(u_ht * qty, 2)
+        line_vat = round(u_vat * qty, 2)
+        line_ttc = round(u_ttc * qty, 2)
+
+        subtotal_ht += line_ht
+        total_vat += line_vat
+        total_ttc += line_ttc
+        total_qty += qty
+
+        desc = it.get("description", "") or ref
+        data.append([ref, desc, str(
+            qty), f"{u_ttc:.2f}", f"{u_ht:.2f}", f"{u_vat:.2f}", f"{line_ttc:.2f}"])
+
+    # (Exemple) Ajouter une ligne “Shipment fees” si présente
+    if order.get("shippingFee"):
+        fee = float(order["shippingFee"])
+        data.append(["", "Shipment fees", "1",
+                    f"{fee:.2f}", f"{(fee/1.05):.2f}", f"{(fee-fee/1.05):.2f}", f"{fee:.2f}"])
+        subtotal_ht += round(fee/1.05, 2)
+        total_vat += round(fee - fee/1.05, 2)
+        total_ttc += fee
+        total_qty += 1
+
+    table = _make_table(
+        data, [32*mm, 60*mm, 16*mm, 22*mm, 28*mm, 20*mm, 22*mm])
+    table.wrapOn(c, 12*mm, y)
+    table.drawOn(c, 12*mm, y - 36*mm)
+    y = y - 38*mm
+
+    # Totaux (avec “voucher” si tu utilises un bon)
+    totals = {
+        "subtotal": f"{subtotal_ht:.2f}",
+        "vat": f"{total_vat:.2f}",
+        "total": f"{total_ttc:.2f}",
+        "paid": f"{total_ttc:.2f}",
+        "qty": str(total_qty),
+        "voucher": str(order.get("voucherAmount", 0)),
+        "after_voucher": f"{(total_ttc - float(order.get('voucherAmount', 0))):.2f}"
+    }
+    _totals_block(c, y, totals, voucher=True)
+
+    _info_footer(c)
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _generate_return_pdf(order):
+    """
+    Même tableau que sale mais montants négatifs selon les quantités (retour).
+    """
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+
+    y = _header_block(c, "TAX CREDIT NOTE", {
+        "customer": _name(order),
+        "label_no": "Credit Note No.",
+        "number": str(order.get("orderNumber", "")),
+        "date": str(order.get("orderDate", "")),
+        "time": _now_hhmm(),
+    })
+
+    data = [[
+        "الرقم المرجعي\nReference",
+        "الوصف\nDescription",
+        "الكمية\nQty",
+        "سعر الوحدة\nU.Price",
+        "سعر الوحدة بدون ضريبة\nValue (Tax Excl)",
+        "نسبة ضريبة 5%\n5% VAT",
+        "المبلغ الإجمالي\nTotal"
+    ]]
+
+    subtotal_ht = 0.0
+    total_vat = 0.0
+    total_ttc = 0.0
+    total_qty = 0
+
+    for it in order.get("items", []):
+        ref = str(it.get("sku", ""))
+        qty = int(it.get("quantity", 0))  # mets -1 pour un retour
+        u_ttc = float(it.get("finalPrice", 0))
+        u_ht = round(u_ttc / 1.05, 2)
+        u_vat = round(u_ttc - u_ht, 2)
+
+        line_ht = round(u_ht * qty, 2)
+        line_vat = round(u_vat * qty, 2)
+        line_ttc = round(u_ttc * qty, 2)
+
+        subtotal_ht += line_ht
+        total_vat += line_vat
+        total_ttc += line_ttc
+        total_qty += qty
+
+        desc = it.get("description", "") or ref
+        data.append([ref, desc, str(
+            qty), f"{u_ttc:.2f}", f"{u_ht:.2f}", f"{u_vat:.2f}", f"{line_ttc:.2f}"])
+
+    table = _make_table(
+        data, [32*mm, 60*mm, 16*mm, 22*mm, 28*mm, 20*mm, 22*mm])
+    table.wrapOn(c, 12*mm, y)
+    table.drawOn(c, 12*mm, y - 28*mm)
+    y = y - 30*mm
+
+    totals = {
+        "subtotal": f"{subtotal_ht:.2f}",
+        "vat": f"{total_vat:.2f}",
+        "total": f"{total_ttc:.2f}",
+        "paid": f"{total_ttc:.2f}",
+        "qty": str(total_qty),
+    }
+    _totals_block(c, y, totals, voucher=False)
+
+    _info_footer(c)
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _generate_replacement_pdf(order):
+    """
+    Remplacement : tableau simple Reference | Description | Qty (comme ton exemple).
+    """
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+
+    y = _header_block(c, "WARRANTY PRODUCT REPLACEMENT NOTE", {
+        "customer": _name(order),
+        "label_no": "Transaction No.",
+        "number": str(order.get("orderNumber", "")),
+        "date": str(order.get("orderDate", "")),
+        "time": _now_hhmm(),
+    })
+
+    data = [[
+        "الرقم المرجعي\nReference",
+        "الوصف\nDescription",
+        "الكمية\nQty"
+    ]]
+
+    total_qty = 0
+    for it in order.get("items", []):
+        ref = str(it.get("sku", ""))
+        qty = int(it.get("quantity", 0))
+        desc = it.get("description", "") or ref
+        data.append([ref, desc, str(qty)])
+        total_qty += qty
+
+    table = _make_table(data, [50*mm, 90*mm, 20*mm])
+    table.wrapOn(c, 12*mm, y)
+    table.drawOn(c, 12*mm, y - 24*mm)
+
+    _info_footer(c)
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
 
 
 def send_invoice_email(order, pdf_bytes):
