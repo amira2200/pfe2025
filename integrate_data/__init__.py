@@ -187,9 +187,15 @@ def extract_excel_from_blob(file_name, source_name) -> pd.DataFrame:
     df["source"] = source_name
     return df
 
+# ---------- Chargement BDD (tables PBI) ----------
+
+
+def _ensure_table(cur, ddl: str):
+    cur.execute(ddl)
+
 
 def load_to_postgres(df: pd.DataFrame, conn):
-    # Remplir 0 pour TOUTES les colonnes numériques -> pas de NULL en BDD
+    """Table détaillée unifiée (comme avant)."""
     numeric_cols = ["quantity", "stock_qty", "purchase_value", "retail_value",
                     "total_ht", "tva", "total_ttc"]
     for c in numeric_cols:
@@ -200,7 +206,7 @@ def load_to_postgres(df: pd.DataFrame, conn):
         df["is_valid"] = df["is_valid"].fillna(False)
 
     cur = conn.cursor()
-    cur.execute("""
+    _ensure_table(cur, """
         CREATE TABLE IF NOT EXISTS unified_data (
             email TEXT,
             sku TEXT,
@@ -241,6 +247,169 @@ def load_to_postgres(df: pd.DataFrame, conn):
                 "is_valid") is not None else False,
             row.get("error_reason")
         ))
+    conn.commit()
+    cur.close()
+
+
+def load_table_stock_snapshot(stock_df: pd.DataFrame, conn):
+    """
+    Snapshot stock (KPI stock) avec déduplication par SKU :
+    - stock_qty        : SUM
+    - purchase_value   : MEDIAN
+    - retail_value     : MEDIAN
+    - stock_value_ht   : retail_value * stock_qty
+    -> évite les violations de clé primaire si un SKU apparaît plusieurs fois dans l'Excel.
+    """
+    if "sku" not in stock_df.columns:
+        return
+
+    df = stock_df.copy()
+
+    # garder uniquement les SKU non vides
+    df = df[df["sku"].notna() & (df["sku"].astype(str).str.strip() != "")]
+
+    # normaliser numériques
+    for c in ["stock_qty", "purchase_value", "retail_value"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    # 🔧 AGRÉGATION PAR SKU (élimine les doublons)
+    agg = df.groupby("sku", as_index=False).agg(
+        stock_qty=("stock_qty", "sum"),
+        purchase_value=("purchase_value", "median"),
+        retail_value=("retail_value", "median"),
+    )
+
+    # valorisation HT
+    agg["stock_value_ht"] = agg["retail_value"].fillna(
+        0) * agg["stock_qty"].fillna(0)
+
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS stock_snapshot (
+            sku TEXT PRIMARY KEY,
+            stock_qty NUMERIC,
+            purchase_value NUMERIC,
+            retail_value NUMERIC,
+            stock_value_ht NUMERIC
+        )
+    """)
+    conn.commit()
+
+    # on repart propre
+    cur.execute("TRUNCATE stock_snapshot")
+
+    # insert upsert-safe (au cas où)
+    rows = [
+        (
+            r["sku"],
+            float(r.get("stock_qty") or 0),
+            float(r.get("purchase_value") or 0),
+            float(r.get("retail_value") or 0),
+            float(r.get("stock_value_ht") or 0),
+        )
+        for _, r in agg.iterrows()
+    ]
+
+    if rows:
+        cur.executemany(
+            """
+            INSERT INTO stock_snapshot (sku, stock_qty, purchase_value, retail_value, stock_value_ht)
+            VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT (sku) DO UPDATE SET
+                stock_qty = EXCLUDED.stock_qty,
+                purchase_value = EXCLUDED.purchase_value,
+                retail_value = EXCLUDED.retail_value,
+                stock_value_ht = EXCLUDED.stock_value_ht
+            """,
+            rows
+        )
+
+    conn.commit()
+    cur.close()
+
+
+def load_table_sales_agg(ventes_df: pd.DataFrame, conn):
+    """
+    Agrégat ventes par SKU (KPI total des ventes).
+    revenue_ht = SUM(qty * (Net w/o Tax si dispo sinon Net w/ Tax/1.20))
+    """
+    if "sku" not in ventes_df.columns:
+        return
+    df = ventes_df.copy()
+    # colonnes possibles
+    if "quantity" not in df.columns:
+        df["quantity"] = 0
+    if "net_wo_tax" not in df.columns:
+        df["net_wo_tax"] = pd.NA
+    if "net_w_tax" not in df.columns:
+        df["net_w_tax"] = pd.NA
+
+    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
+    df["net_wo_tax"] = pd.to_numeric(df["net_wo_tax"], errors="coerce")
+    df["net_w_tax"] = pd.to_numeric(df["net_w_tax"], errors="coerce")
+
+    # prix HT par ligne: HT prioritaire, sinon TTC/1.20
+    df["price_ht_row"] = df["net_wo_tax"]
+    df.loc[df["price_ht_row"].isna(), "price_ht_row"] = df["net_w_tax"] / 1.20
+
+    # revenue HT par ligne
+    df["revenue_ht_row"] = df["quantity"] * df["price_ht_row"].fillna(0)
+
+    g = df.groupby("sku", as_index=False).agg(
+        qty_sold=("quantity", "sum"),
+        revenue_ht=("revenue_ht_row", "sum"),
+        price_ht_from_sales=("price_ht_row", "median")
+    )
+
+    cur = conn.cursor()
+    _ensure_table(cur, """
+        CREATE TABLE IF NOT EXISTS sales_agg (
+            sku TEXT PRIMARY KEY,
+            qty_sold NUMERIC,
+            revenue_ht NUMERIC,
+            price_ht_from_sales NUMERIC
+        )
+    """)
+    conn.commit()
+    cur.execute("TRUNCATE sales_agg")
+    rows = [
+        (r["sku"] or "", float(r.get("qty_sold") or 0), float(
+            r.get("revenue_ht") or 0), float(r.get("price_ht_from_sales") or 0))
+        for _, r in g.iterrows()
+    ]
+    if rows:
+        cur.executemany(
+            "INSERT INTO sales_agg (sku, qty_sold, revenue_ht, price_ht_from_sales) VALUES (%s,%s,%s,%s)", rows)
+    conn.commit()
+    cur.close()
+
+
+def load_table_order_errors(merged_df: pd.DataFrame, conn):
+    """Commandes erronées (pour KPI)."""
+    err = merged_df[(~merged_df["is_valid"]) | (
+        merged_df["quantity"] <= 0)].copy()
+    # normalise numériques
+    for c in ["quantity", "total_ht", "total_ttc"]:
+        if c in err.columns:
+            err[c] = pd.to_numeric(err[c], errors="coerce").fillna(0)
+
+    cur = conn.cursor()
+    _ensure_table(cur, """
+        CREATE TABLE IF NOT EXISTS order_errors (
+            email TEXT,
+            sku TEXT,
+            quantity INT,
+            error_reason TEXT
+        )
+    """)
+    conn.commit()
+    cur.execute("TRUNCATE order_errors")
+    rows = [(r.get("email") or "", r.get("sku") or "", int(r.get("quantity") or 0), r.get("error_reason") or "")
+            for _, r in err.iterrows()]
+    if rows:
+        cur.executemany(
+            "INSERT INTO order_errors (email, sku, quantity, error_reason) VALUES (%s,%s,%s,%s)", rows)
     conn.commit()
     cur.close()
 
@@ -374,7 +543,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             logging.warning(
                 "⚠️ Mapping ventes non détecté. Colonnes: %s", list(ventes_df.columns))
 
-        # 1er token avant normalisation
+        # 1er token avant normalisation (ex: "DA001234   X" -> "DA001234")
         if "sku" in stock_df.columns:
             stock_df["sku"] = stock_df["sku"].astype(
                 str).str.strip().str.split().str[0]
@@ -387,11 +556,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         retry_df = clean_and_normalize(retry_df)
         ventes_df = clean_and_normalize(ventes_df)
 
-        # (sécurité) dédupliquer
         stock_df = _drop_dupe_columns(stock_df)
         ventes_df = _drop_dupe_columns(ventes_df)
 
-        # ---- PRIX depuis Ventes (médiane par SKU), vectorisé
+        # ---- Prix HT par SKU depuis Ventes (médiane ou TTC/1.20)
         price_cols = [c for c in ["net_wo_tax", "net_w_tax"]
                       if c in ventes_df.columns]
         price_cols = list(dict.fromkeys(price_cols))
@@ -408,24 +576,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         else:
             sales_price = pd.DataFrame(columns=["sku", "retail_from_sales"])
 
-        # Diagnostic
-        logging.info(
-            "📈 stock non-null -> stock_qty:%d purchase:%d retail:%d",
-            int(stock_df["stock_qty"].notna().sum()
-                ) if "stock_qty" in stock_df else -1,
-            int(stock_df["purchase_value"].notna().sum()
-                ) if "purchase_value" in stock_df else -1,
-            int(stock_df["retail_value"].notna().sum()
-                ) if "retail_value" in stock_df else -1
-        )
-
-        # Colonnes utiles pour les merges
+        # Colonnes utiles pour le merge stock
         keep_cols = [c for c in ["sku", "stock_qty",
                                  "purchase_value", "retail_value"] if c in stock_df.columns]
         stock_df = stock_df[keep_cols]
-        ventes_qty = (ventes_df[["sku", "quantity"]].rename(columns={"quantity": "quantity_sales"})
-                      if "sku" in ventes_df.columns and "quantity" in ventes_df.columns
-                      else pd.DataFrame(columns=["sku", "quantity_sales"]))
 
         # 4) FUSIONS
         merged_df = retry_df.merge(
@@ -435,33 +589,37 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         if not sales_price.empty:
             merged_df = merged_df.merge(
                 sales_price[["sku", "retail_from_sales"]], on="sku", how="left")
-        if not ventes_qty.empty:
-            merged_df = merged_df.merge(ventes_qty, on="sku", how="left")
 
-        # retail_value final = stock.retail_value OU ventes (HT calculé) -> vectorisé (pas d'apply)
+        # retail_value final = stock.retail_value OU ventes (HT calculé)
         if "retail_value" in merged_df.columns:
             merged_df["retail_value"] = merged_df["retail_value"].fillna(
                 merged_df.get("retail_from_sales"))
         else:
             merged_df["retail_value"] = merged_df.get("retail_from_sales")
 
-        # 5) RÈGLES
+        # 5) RÈGLES + CALCULS
         merged_df["is_valid_sku"] = (merged_df["_merge_stock"] == "both")
         merged_df.drop(
             columns=["_merge_stock", "retail_from_sales"], inplace=True, errors="ignore")
         merged_df = apply_business_rules(merged_df, stock_df)
-
-        # 6) CALCULS
         merged_df = calculate_financials(merged_df)
+
         logging.info(
             "💰 lignes avec retail_value(HT)>0: %d ; total_ttc>0: %d",
             int((merged_df.get("retail_value", 0).fillna(0) > 0).sum()),
             int((merged_df.get("total_ttc", 0).fillna(0) > 0).sum())
         )
 
-        # 7) CHARGEMENT (sans NULL numériques)
+        # 6) CHARGEMENT (4 tables PBI-friendly)
         try:
+            # détails (comme avant)
             load_to_postgres(merged_df, conn)
+            # KPI 2 : stock snapshot
+            load_table_stock_snapshot(stock_df, conn)
+            # KPI 1 : total des ventes (agrégat depuis fichier ventes)
+            load_table_sales_agg(ventes_df, conn)
+            # KPI 3 : commandes erronées
+            load_table_order_errors(merged_df, conn)
         finally:
             try:
                 conn.close()
@@ -475,7 +633,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             f"stock_sample={_sample(set(stock_df['sku'].dropna().unique()))}"
         )
         logging.info("📤 SUMMARY: %s", summary)
-        return func.HttpResponse("Pipeline exécuté et données insérées dans unified_data\n" + summary, status_code=200)
+        return func.HttpResponse(
+            "Pipeline exécuté: unified_data, stock_snapshot, sales_agg, order_errors chargées\n" + summary,
+            status_code=200
+        )
 
     except Exception:
         logging.exception("🔥 Exception non gérée")
