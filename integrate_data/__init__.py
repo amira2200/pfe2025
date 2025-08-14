@@ -175,8 +175,28 @@ def calculate_financials(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def extract_retry_table(conn) -> pd.DataFrame:
-    df = pd.read_sql("SELECT * FROM retry_table", conn)
-    df[["email", "sku", "quantity"]] = df["payload"].apply(parse_payload)
+    # on lit la VUE (elle garde les payloads intacts et expose des colonnes propres)
+    df = pd.read_sql("SELECT * FROM retry_enriched", conn)
+
+    # normalisations minimes
+    df["email"] = df["email"].astype(str).str.lower().str.strip()
+    df["sku"] = df["sku"].astype(str).str.strip()
+    df["quantity"] = pd.to_numeric(
+        df["quantity"], errors="coerce").fillna(0).astype(int)
+
+    df["order_type"] = df["order_type"].astype(str).str.lower()
+    df.loc[df["order_type"].eq("return"), "quantity"] *= -1
+
+    # prix HT dérivé du payload (final_price_ttc prioritaire, sinon original_price_ttc)
+    df["final_price_ttc"] = pd.to_numeric(
+        df["final_price_ttc"], errors="coerce")
+    df["original_price_ttc"] = pd.to_numeric(
+        df["original_price_ttc"], errors="coerce")
+    df["price_ttc_payload"] = df["final_price_ttc"].fillna(
+        df["original_price_ttc"])
+    df["price_ht_payload"] = (
+        df["price_ttc_payload"] / 1.20).where(df["price_ttc_payload"].notna())
+
     df["source"] = "middleware"
     return df
 
@@ -253,37 +273,73 @@ def load_to_postgres(df: pd.DataFrame, conn):
 
 def load_table_stock_snapshot(stock_df: pd.DataFrame, conn):
     """
-    Snapshot stock (KPI stock) avec déduplication par SKU :
-    - stock_qty        : SUM
-    - purchase_value   : MEDIAN
-    - retail_value     : MEDIAN
-    - stock_value_ht   : retail_value * stock_qty
-    -> évite les violations de clé primaire si un SKU apparaît plusieurs fois dans l'Excel.
+    Snapshot stock (KPI stock) avec fallback de prix :
+    Prix prioritaire HT = retail_value (stock) -> price_ht_from_sales (ventes) -> purchase_value (PA)
+    stock_value_ht = price_ht_priority * stock_qty
     """
     if "sku" not in stock_df.columns:
         return
 
+    # 1) Nettoyage/agrégation côté stock (élimine doublons SKU)
     df = stock_df.copy()
-
-    # garder uniquement les SKU non vides
     df = df[df["sku"].notna() & (df["sku"].astype(str).str.strip() != "")]
-
-    # normaliser numériques
     for c in ["stock_qty", "purchase_value", "retail_value"]:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # 🔧 AGRÉGATION PAR SKU (élimine les doublons)
-    agg = df.groupby("sku", as_index=False).agg(
+    # Quantités négatives -> 0 (sécurité)
+    df["stock_qty"] = df.get("stock_qty", 0).fillna(0)
+    df.loc[df["stock_qty"] < 0, "stock_qty"] = 0
+
+    stock_agg = df.groupby("sku", as_index=False).agg(
         stock_qty=("stock_qty", "sum"),
         purchase_value=("purchase_value", "median"),
         retail_value=("retail_value", "median"),
     )
 
-    # valorisation HT
-    agg["stock_value_ht"] = agg["retail_value"].fillna(
-        0) * agg["stock_qty"].fillna(0)
+    # 2) Prix HT issus des ventes (peut être vide si pas de table/valeurs)
+    try:
+        sales = pd.read_sql(
+            "SELECT sku, price_ht_from_sales FROM sales_agg", conn)
+    except Exception:
+        sales = pd.DataFrame(columns=["sku", "price_ht_from_sales"])
 
+    # 3) Fallback prix : traiter 0 et négatifs comme manquants AVANT le coalesce
+    out = stock_agg.merge(sales, on="sku", how="left")
+
+    for c in ["retail_value", "price_ht_from_sales", "purchase_value", "stock_qty"]:
+        if c not in out.columns:
+            out[c] = pd.NA
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    # 0 ou <0 -> NaN pour forcer le fallback
+    for c in ["retail_value", "price_ht_from_sales", "purchase_value"]:
+        out[c] = out[c].mask(out[c] <= 0)
+
+    out["stock_qty"] = out["stock_qty"].fillna(0)
+
+    # coalesce propre (stock > ventes > PA)
+    out["price_ht_priority"] = (
+        out["retail_value"]
+        .combine_first(out["price_ht_from_sales"])
+        .combine_first(out["purchase_value"])
+        .fillna(0)
+    )
+
+    # 4) Valorisation HT
+    out["stock_value_ht"] = out["price_ht_priority"] * out["stock_qty"]
+
+    # Normalise toutes les colonnes numériques (évite pd.NA dans l'insert)
+    num_cols = [
+        "stock_qty", "purchase_value", "retail_value",
+        "price_ht_from_sales", "price_ht_priority", "stock_value_ht"
+    ]
+    for c in num_cols:
+        if c not in out.columns:
+            out[c] = 0
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(float)
+
+    # 5) Écriture
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS stock_snapshot (
@@ -291,40 +347,45 @@ def load_table_stock_snapshot(stock_df: pd.DataFrame, conn):
             stock_qty NUMERIC,
             purchase_value NUMERIC,
             retail_value NUMERIC,
+            price_ht_from_sales NUMERIC,
+            price_ht_priority NUMERIC,
             stock_value_ht NUMERIC
         )
     """)
     conn.commit()
 
-    # on repart propre
+    # Migration douce au cas où
+    cur.execute(
+        "ALTER TABLE stock_snapshot ADD COLUMN IF NOT EXISTS price_ht_from_sales NUMERIC")
+    cur.execute(
+        "ALTER TABLE stock_snapshot ADD COLUMN IF NOT EXISTS price_ht_priority NUMERIC")
+    cur.execute(
+        "ALTER TABLE stock_snapshot ADD COLUMN IF NOT EXISTS stock_value_ht NUMERIC")
+    conn.commit()
+
     cur.execute("TRUNCATE stock_snapshot")
 
-    # insert upsert-safe (au cas où)
     rows = [
         (
             r["sku"],
-            float(r.get("stock_qty") or 0),
-            float(r.get("purchase_value") or 0),
-            float(r.get("retail_value") or 0),
-            float(r.get("stock_value_ht") or 0),
+            r["stock_qty"],
+            r["purchase_value"],
+            r["retail_value"],
+            r["price_ht_from_sales"],
+            r["price_ht_priority"],
+            r["stock_value_ht"],
         )
-        for _, r in agg.iterrows()
+        for _, r in out.iterrows()
     ]
-
     if rows:
         cur.executemany(
             """
-            INSERT INTO stock_snapshot (sku, stock_qty, purchase_value, retail_value, stock_value_ht)
-            VALUES (%s,%s,%s,%s,%s)
-            ON CONFLICT (sku) DO UPDATE SET
-                stock_qty = EXCLUDED.stock_qty,
-                purchase_value = EXCLUDED.purchase_value,
-                retail_value = EXCLUDED.retail_value,
-                stock_value_ht = EXCLUDED.stock_value_ht
+            INSERT INTO stock_snapshot
+            (sku, stock_qty, purchase_value, retail_value, price_ht_from_sales, price_ht_priority, stock_value_ht)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
             """,
             rows
         )
-
     conn.commit()
     cur.close()
 
@@ -597,6 +658,17 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         else:
             merged_df["retail_value"] = merged_df.get("retail_from_sales")
 
+        # --- Fallbacks supplémentaires ---
+        # 1) prix HT issu du payload (final_price_ttc / 1.20 sinon original_price_ttc / 1.20)
+        merged_df["retail_value"] = merged_df["retail_value"].fillna(
+            merged_df.get("price_ht_payload"))
+        # 2) dernier filet : valeur d'achat (PA)
+        merged_df["retail_value"] = merged_df["retail_value"].fillna(
+            merged_df.get("purchase_value"))
+        # s'assurer que c'est bien numérique pour les calculs
+        merged_df["retail_value"] = pd.to_numeric(
+            merged_df["retail_value"], errors="coerce")
+
         # 5) RÈGLES + CALCULS
         merged_df["is_valid_sku"] = (merged_df["_merge_stock"] == "both")
         merged_df.drop(
@@ -614,10 +686,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         try:
             # détails (comme avant)
             load_to_postgres(merged_df, conn)
-            # KPI 2 : stock snapshot
-            load_table_stock_snapshot(stock_df, conn)
-            # KPI 1 : total des ventes (agrégat depuis fichier ventes)
+           # KPI 1 : total des ventes (agrégat depuis fichier ventes)
             load_table_sales_agg(ventes_df, conn)
+            # KPI 2 : stock snapshot (utilise sales_agg comme fallback de prix)
+            load_table_stock_snapshot(stock_df, conn)
+
             # KPI 3 : commandes erronées
             load_table_order_errors(merged_df, conn)
         finally:
