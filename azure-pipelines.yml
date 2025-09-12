@@ -1,38 +1,34 @@
 trigger:
-- master   # -> mets 'main' si ta branche s'appelle main
+- master   # mets 'main' si c'est ta branche par défaut
 
 pool:
-  name: Default
+  name: Default   # ton agent self-hosted
 
 variables:
   PYTHON_VERSION: '3.10'
 
 steps:
-# 1) Python
+# 1) (optionnel sur self-hosted) sélection de version Python
 - task: UsePythonVersion@0
   displayName: 'Use Python $(PYTHON_VERSION)'
   inputs:
     versionSpec: '$(PYTHON_VERSION)'
     addToPath: true
 
-# 2) Dépendances dans .python_packages à la RACINE du repo (là où est requirements.txt)
+# 2) Installer les dépendances dans .python_packages à la racine
 - script: |
     python -m pip install --upgrade pip
-    pip install -r requirements.txt --target=".python_packages/lib/site-packages"
+    python -m pip install -r requirements.txt --target=".python_packages/lib/site-packages"
   displayName: 'Install deps → .python_packages/'
 
-# 3) (Sécurité) enlever une config locale éventuelle
-- script: |
-    if [ -f local.settings.json ]; then rm local.settings.json; fi
-  displayName: 'Remove local.settings.json if present'
-
-# 4) Staging minimal (host.json + code + deps)
+# 3) Staging minimal (on garde local.settings.json)
 - task: CopyFiles@2
   displayName: 'Stage files for package'
   inputs:
     SourceFolder: '$(Build.SourcesDirectory)'
     Contents: |
       host.json
+      local.settings.json   # <<< on l'inclut
       requirements.txt
       shared.py
       **/*.py
@@ -44,7 +40,7 @@ steps:
       !**/.venv/**/*
     TargetFolder: '$(Build.ArtifactStagingDirectory)/package'
 
-# 5) ZIP déployable
+# 4) ZIP déployable
 - task: ArchiveFiles@2
   displayName: 'Zip package'
   inputs:
@@ -54,7 +50,7 @@ steps:
     archiveFile: '$(Build.ArtifactStagingDirectory)/functionapp.zip'
     replaceExistingArchive: true
 
-# 6) Publier l’artefact
+# 5) Publier l’artefact
 - task: PublishBuildArtifacts@1
   displayName: 'Publish artifact'
   inputs:
