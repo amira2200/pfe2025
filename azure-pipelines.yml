@@ -1,59 +1,85 @@
 trigger:
-- master   # mets 'main' si c'est ta branche par défaut
+- master   
 
 pool:
-  name: Default   # ton agent self-hosted
+  name: Default  
 
 variables:
   PYTHON_VERSION: '3.10'
 
-steps:
-# 1) (optionnel sur self-hosted) sélection de version Python
-- task: UsePythonVersion@0
-  displayName: 'Use Python $(PYTHON_VERSION)'
-  inputs:
-    versionSpec: '$(PYTHON_VERSION)'
-    addToPath: true
+stages:
 
-# 2) Installer les dépendances dans .python_packages à la racine
-- script: |
-    python -m pip install --upgrade pip
-    python -m pip install -r requirements.txt --target=".python_packages/lib/site-packages"
-  displayName: 'Install deps → .python_packages/'
+# ========================
+# 1) CI : Build & Package
+# ========================
+- stage: Build
+  displayName: "Build and Package"
+  jobs:
+  - job: Build
+    steps:
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(PYTHON_VERSION)'
+      inputs:
+        versionSpec: '$(PYTHON_VERSION)'
+        addToPath: true
 
-# 3) Staging minimal (on garde local.settings.json)
-- task: CopyFiles@2
-  displayName: 'Stage files for package'
-  inputs:
-    SourceFolder: '$(Build.SourcesDirectory)'
-    Contents: |
-      host.json
-      local.settings.json   # <<< on l'inclut
-      requirements.txt
-      shared.py
-      **/*.py
-      .python_packages/**/*
-      !.git/**/*
-      !.vscode/**/*
-      !**/__pycache__/**/*
-      !**/*.pyc
-      !**/.venv/**/*
-    TargetFolder: '$(Build.ArtifactStagingDirectory)/package'
+    - script: |
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements.txt --target=".python_packages/lib/site-packages"
+      displayName: 'Install dependencies → .python_packages/'
 
-# 4) ZIP déployable
-- task: ArchiveFiles@2
-  displayName: 'Zip package'
-  inputs:
-    rootFolderOrFile: '$(Build.ArtifactStagingDirectory)/package'
-    includeRootFolder: false
-    archiveType: 'zip'
-    archiveFile: '$(Build.ArtifactStagingDirectory)/functionapp.zip'
-    replaceExistingArchive: true
+    - task: CopyFiles@2
+      displayName: 'Stage files for package'
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)'
+        Contents: |
+          host.json
+          local.settings.json
+          requirements.txt
+          shared.py
+          **/*.py
+          .python_packages/**/*
+          !.git/**/*
+          !.vscode/**/*
+          !**/__pycache__/**/*
+          !**/*.pyc
+          !**/.venv/**/*
+        TargetFolder: '$(Build.ArtifactStagingDirectory)/package'
 
-# 5) Publier l’artefact
-- task: PublishBuildArtifacts@1
-  displayName: 'Publish artifact'
-  inputs:
-    pathToPublish: '$(Build.ArtifactStagingDirectory)'
-    artifactName: 'drop'
-    publishLocation: 'Container'
+    - task: ArchiveFiles@2
+      displayName: 'Zip package'
+      inputs:
+        rootFolderOrFile: '$(Build.ArtifactStagingDirectory)/package'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/functionapp.zip'
+        replaceExistingArchive: true
+
+    - publish: '$(Build.ArtifactStagingDirectory)'
+      artifact: drop
+
+# ========================
+# 2) CD : Deploy to Azure
+# ========================
+- stage: Deploy
+  displayName: "Deploy to Azure Function"
+  dependsOn: Build
+  jobs:
+  - deployment: DeployToAzure
+    displayName: "Deploy Function App"
+    environment: 'dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+
+          - task: AzureFunctionApp@1
+            displayName: 'Deploy to amira-functionapp'
+            inputs:
+              connectedServiceNameARM: 'Azure subscription 1 (79d70fcd-2018-4a86-bbf8-9c1f7d4e54c3)'
+              appType: 'functionApp'   # si ton Azure Function tourne sur Linux, sinon mets 'functionApp'
+              functionAppName: 'amira-functionapp'
+              package: '$(Pipeline.Workspace)/drop/functionapp.zip'
+              
