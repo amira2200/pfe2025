@@ -1,0 +1,37 @@
+# azure-pipelines-cd.yml  (déploiement auto après la CI)
+
+resources:
+  pipelines:
+  - pipeline: ci
+    source: amira2200.pfe2025        # nom EXACT de ta pipeline CI
+    project: $(System.TeamProject)
+    trigger: true                    # déclenche ce CD à chaque CI réussie
+
+pool:
+  name: Default                      # ton agent self-hosted
+
+variables:
+  azureServiceConnection: 'azure-sp-pfe'   # service connection ARM
+  functionAppName: 'amira-functionapp'     # nom exact de ta Function App
+  appType: 'webApp'                         # ✅ Windows
+  artifactName: 'drop'
+  packagePath: '$(Pipeline.Workspace)/ci/$(artifactName)/functionapp.zip'
+
+stages:
+- stage: Deploy
+  displayName: 'Deploy to Azure Functions (Windows)'
+  jobs:
+  - job: DeployJob
+    steps:
+    - download: ci
+      artifact: $(artifactName)
+
+    - task: AzureWebApp@1
+      displayName: 'Deploy $(packagePath) to $(functionAppName)'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        appType: '$(appType)'
+        appName: '$(functionAppName)'
+        package: '$(packagePath)'
+        # resourceGroupName: ''   # optionnel
+        # slotName: ''            # optionnel
