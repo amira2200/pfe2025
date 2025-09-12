@@ -59,7 +59,7 @@ stages:
       artifact: drop
 
 # ========================
-# 2) CD : Deploy to Azure
+# 2) CD : Deploy to Azure (Publish Profile)
 # ========================
 - stage: Deploy
   displayName: "Deploy to Azure Function"
@@ -75,11 +75,11 @@ stages:
           - download: current
             artifact: drop
 
-          - task: AzureFunctionApp@1
-            displayName: 'Deploy to amira-functionapp'
+          # Option A (recommandé) : Tâche officielle avec publishProfile (pas de Service Connection)
+          - task: AzureFunctionApp@2
+            displayName: 'Zip Deploy via Publish Profile'
             inputs:
-              connectedServiceNameARM: 'Azure subscription 1 (79d70fcd-2018-4a86-bbf8-9c1f7d4e54c3)'
-              appType: 'functionApp'   # si ton Azure Function tourne sur Linux, sinon mets 'functionApp'
-              functionAppName: 'amira-functionapp'
-              package: '$(Pipeline.Workspace)/drop/functionapp.zip'
-              
+              appType: 'functionAppLinux'            # 'functionApp' si ton App Service est Windows
+              appName: 'amira-functionapp'
+              package: '$(Pipeline.Workspace)/drop/functionapp.zip'   # zip produit en CI
+              publishProfile: '$(AZURE_FUNCTIONAPP_PUBLISH_PROFILE)'
