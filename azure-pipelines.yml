@@ -57,7 +57,6 @@ stages:
 
     - publish: '$(Build.ArtifactStagingDirectory)'
       artifact: drop
-
 # ========================
 # 2) CD : Deploy to Azure (Publish Profile)
 # ========================
@@ -75,11 +74,19 @@ stages:
           - download: current
             artifact: drop
 
-          # Option A (recommandé) : Tâche officielle avec publishProfile (pas de Service Connection)
-          - task: AzureFunctionApp@2
+          # (Optional) sanity check: list downloaded files
+          - powershell: |
+              Write-Host "Listing $(Pipeline.Workspace)\drop"
+              Get-ChildItem -Recurse "$(Pipeline.Workspace)/drop" | Select-Object FullName, Length
+            displayName: 'List downloaded artifact'
+
+          # Zip Deploy using publish profile (NO service connection)
+          - task: AzureWebApp@1
             displayName: 'Zip Deploy via Publish Profile'
             inputs:
-              appType: 'functionAppLinux'            # 'functionApp' si ton App Service est Windows
+              appType: 'functionApp'                 # use 'functionApp' if your Function App is Window
               appName: 'amira-functionapp'
-              package: '$(Pipeline.Workspace)/drop/functionapp.zip'   # zip produit en CI
+              package: '$(Pipeline.Workspace)/drop/functionapp.zip'
               publishProfile: '$(AZURE_FUNCTIONAPP_PUBLISH_PROFILE)'
+
+
