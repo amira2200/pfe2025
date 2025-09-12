@@ -2,7 +2,7 @@ trigger:
 - master   # -> mets 'main' si ta branche s'appelle main
 
 pool:
-  vmImage: 'ubuntu-latest'
+  name: Default
 
 variables:
   PYTHON_VERSION: '3.10'
