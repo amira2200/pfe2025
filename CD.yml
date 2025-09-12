@@ -1,32 +1,32 @@
+trigger: none
+
 resources:
   pipelines:
-  - pipeline: ci
-    source: "azure-pipelines"      # nom du pipeline CI (pas le fichier, pas le projet)
-    project: "amira2200.pfe2025"   # ton projet DevOps
-    branch: master                 # ou main selon ta branche
-    trigger: true
+  - pipeline: ci                  # alias (à réutiliser plus bas)
+    source: amira2200.pfe2025     # NOM EXACT du pipeline CI (tel qu'affiché dans DevOps)
+    trigger: true                 # déclenche ce CD quand la CI réussit
 
 pool:
   name: Default
 
 variables:
   functionAppName: 'amira-functionapp'
-  artifactName: 'drop'
+  artifactName: 'drop'            # doit matcher PublishBuildArtifacts de la CI
   packagePath: '$(Pipeline.Workspace)/ci/$(artifactName)/functionapp.zip'
 
 stages:
 - stage: Deploy
-  displayName: 'Deploy to Azure Functions (Windows)'
+  displayName: 'Deploy to Azure Function App'
   jobs:
   - job: DeployJob
     steps:
-    - download: ci
+    - download: ci                # même alias que ci-dessus
       artifact: $(artifactName)
 
-    - task: AzureFunctionApp@2
+    - task: AzureWebApp@1
       displayName: 'Deploy $(packagePath) to $(functionAppName)'
       inputs:
-        connectedServiceNameARM: 'Azure subscription 1 (79d70fcd-2018-4a86-bbf8-9c1f7d4e54c3)'
-        appType: 'functionApp'
+        azureSubscription: 'Azure subscription 1'
+        appType: 'functionApp'    # c'est bien une Azure Function
         appName: '$(functionAppName)'
         package: '$(packagePath)'
