@@ -60,33 +60,31 @@ stages:
 # ========================
 # 2) CD : Deploy to Azure (Publish Profile)
 # ========================
-- stage: Deploy
-  displayName: "Deploy to Azure Function"
-  dependsOn: Build
-  jobs:
-  - deployment: DeployToAzure
-    displayName: "Deploy Function App"
-    environment: 'dev'
-    strategy:
-      runOnce:
-        deploy:
-          steps:
-          - download: current
-            artifact: drop
+# après: - download: current  artifact: drop
+    - task: PowerShell@2
+      displayName: 'Kudu ZIP Deploy (Publish Profile, no Service Connection)'
+      inputs:
+        targetType: 'inline'
+        pwsh: true
+        script: |
+          $ErrorActionPreference = "Stop"
 
-          # (Optional) sanity check: list downloaded files
-          - powershell: |
-              Write-Host "Listing $(Pipeline.Workspace)\drop"
-              Get-ChildItem -Recurse "$(Pipeline.Workspace)/drop" | Select-Object FullName, Length
-            displayName: 'List downloaded artifact'
+          if (-not "$(AZURE_FUNCTIONAPP_PUBLISH_PROFILE)") {
+            throw "Missing secret variable AZURE_FUNCTIONAPP_PUBLISH_PROFILE"
+          }
 
-          # Zip Deploy using publish profile (NO service connection)
-          - task: AzureWebApp@1
-            displayName: 'Zip Deploy via Publish Profile'
-            inputs:
-              appType: 'functionApp'                 # use 'functionApp' if your Function App is Window
-              appName: 'amira-functionapp'
-              package: '$(Pipeline.Workspace)/drop/functionapp.zip'
-              publishProfile: '$(AZURE_FUNCTIONAPP_PUBLISH_PROFILE)'
+          $xml = [xml]"$(AZURE_FUNCTIONAPP_PUBLISH_PROFILE)"
+          $pub = $xml.publishData.publishProfile | Where-Object { $_.publishMethod -eq "ZipDeploy" } | Select-Object -First 1
+          if (-not $pub) { throw "No ZipDeploy profile found in publish profile." }
 
+          $zip = "$(Pipeline.Workspace)/drop/functionapp.zip"
+          if (-not (Test-Path $zip)) { throw "ZIP not found: $zip" }
 
+          $pair = "$($pub.userName):$($pub.userPWD)"
+          $b64  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+          $hdrs = @{ Authorization = "Basic $b64" }
+          $scm  = "https://$($pub.publishUrl)/api/zipdeploy"
+
+          Write-Host "POST $scm with $zip"
+          $resp = Invoke-WebRequest -Uri $scm -Method Post -InFile $zip -ContentType "application/zip" -Headers $hdrs -UseBasicParsing
+          Write-Host "ZipDeploy HTTP: $($resp.StatusCode)"
