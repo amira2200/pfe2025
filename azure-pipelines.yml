@@ -1,5 +1,5 @@
 trigger:
-- main   # change si ta branche s'appelle autrement
+- master   # -> mets 'main' si ta branche s'appelle main
 
 pool:
   vmImage: 'ubuntu-latest'
@@ -8,25 +8,25 @@ variables:
   PYTHON_VERSION: '3.10'
 
 steps:
-# 1) Choisir la version de Python
+# 1) Python
 - task: UsePythonVersion@0
   displayName: 'Use Python $(PYTHON_VERSION)'
   inputs:
     versionSpec: '$(PYTHON_VERSION)'
     addToPath: true
 
-# 2) Installer les dépendances dans .python_packages du projet (racine)
+# 2) Dépendances dans .python_packages à la RACINE du repo (là où est requirements.txt)
 - script: |
     python -m pip install --upgrade pip
     pip install -r requirements.txt --target=".python_packages/lib/site-packages"
   displayName: 'Install deps → .python_packages/'
 
-# 3) (Sécurité) retirer la config locale si elle existe
+# 3) (Sécurité) enlever une config locale éventuelle
 - script: |
     if [ -f local.settings.json ]; then rm local.settings.json; fi
   displayName: 'Remove local.settings.json if present'
 
-# 4) Préparer un dossier de staging minimal (code + deps + host.json)
+# 4) Staging minimal (host.json + code + deps)
 - task: CopyFiles@2
   displayName: 'Stage files for package'
   inputs:
@@ -44,7 +44,7 @@ steps:
       !**/.venv/**/*
     TargetFolder: '$(Build.ArtifactStagingDirectory)/package'
 
-# 5) Créer l’archive déployable
+# 5) ZIP déployable
 - task: ArchiveFiles@2
   displayName: 'Zip package'
   inputs:
@@ -54,7 +54,7 @@ steps:
     archiveFile: '$(Build.ArtifactStagingDirectory)/functionapp.zip'
     replaceExistingArchive: true
 
-# 6) Publier l’artefact (pour la Release/CD)
+# 6) Publier l’artefact
 - task: PublishBuildArtifacts@1
   displayName: 'Publish artifact'
   inputs:
