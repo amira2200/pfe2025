@@ -1,0 +1,59 @@
+trigger:
+- master   
+
+pool:
+  name: Default  
+
+variables:
+  PYTHON_VERSION: '3.10'
+
+stages:
+
+# ========================
+# 1) CI : Build & Package
+# ========================
+- stage: Build
+  displayName: "Build and Package"
+  jobs:
+  - job: Build
+    steps:
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(PYTHON_VERSION)'
+      inputs:
+        versionSpec: '$(PYTHON_VERSION)'
+        addToPath: true
+
+    - script: |
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements.txt --target=".python_packages/lib/site-packages"
+      displayName: 'Install dependencies → .python_packages/'
+
+    - task: CopyFiles@2
+      displayName: 'Stage files for package'
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)'
+        Contents: |
+          host.json
+          local.settings.json
+          requirements.txt
+          shared.py
+          **/*.py
+          .python_packages/**/*
+          !.git/**/*
+          !.vscode/**/*
+          !**/__pycache__/**/*
+          !**/*.pyc
+          !**/.venv/**/*
+        TargetFolder: '$(Build.ArtifactStagingDirectory)/package'
+
+    - task: ArchiveFiles@2
+      displayName: 'Zip package'
+      inputs:
+        rootFolderOrFile: '$(Build.ArtifactStagingDirectory)/package'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/functionapp.zip'
+        replaceExistingArchive: true
+
+    - publish: '$(Build.ArtifactStagingDirectory)'
+      artifact: drop
